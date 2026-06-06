@@ -1,44 +1,58 @@
 # Matter & Thread Network Self-Healing & Route Optimization Guide
 
-This repository contains troubleshooting notes, scripts, and configurations for automatically diagnosing and remediating unresponsive Matter/Thread smart home devices in a self-hosted environment (e.g., Home Assistant, Docker, OTBR).
-
-## 1. The Core Issue: IPv6 Routing Metric Conflicts
-
-In multi-Border Router setups (e.g., combining an OpenThread Border Router (OTBR) USB dongle with Apple HomePods or Google Nest Hubs), Linux hosts frequently encounter IPv6 routing metric conflicts.
-
-### The Conflict
-- **Remote Border Routers**: Apple/Google border routers advertise the Thread network ULA prefix (e.g., `fdbc:271:669f::/64`) over the LAN via Router Advertisements (RAs). The host learns this route on its physical network interface (e.g., `enu1c2`) with a default RA metric (often `105`).
-- **Local Border Router**: The local OTBR agent configures the local `wpan0` Thread interface and registers a route for the same prefix, but typically assigns it a higher metric (often `120`).
-- **The Result**: Because a lower metric indicates higher priority (`105 < 120`), the Linux host routes Thread traffic destined for local devices out of the physical Ethernet interface and across the LAN, instead of directly using the local coordinator dongle on `wpan0`. If remote border routers restart or drop packets, all local Thread devices instantly go unresponsive.
-
-### Additional Thread Failure Modes
-1. **Sleepy End Devices (SEDs) & Orphaned Children**: Battery-powered Thread devices disable their radios to save energy and poll their Parent Router for messages. If the Parent Router reboots or exhausts its child table, children are orphaned and remain offline until forced to re-pair.
-2. **Network Partitions**: The Thread mesh can partition if physical obstructions or interference prevent routers from communicating, splitting the network into independent islands.
+This repository is a self-contained guide, including scripts and configurations, for diagnosing and automatically remediating unresponsive Matter-over-Thread smart home devices in Linux-based dockerized environments (e.g., Home Assistant with `python-matter-server` and OpenThread Border Router).
 
 ---
 
-## 2. The Solutions
+## 1. Network-Level Issues & Solutions
 
-We implemented a three-tier self-healing system to automatically optimize network routing and recover from device drops.
+### A. IPv6 Routing Metric Conflict
+#### The Background
+In smart home environments that combine a local OpenThread Border Router (OTBR) USB dongle with remote border routers (like Apple HomePods or Google Nest Hubs), the Linux host frequently encounters routing conflicts:
+- **Remote Border Routers** advertise the Thread network ULA prefix (e.g., `fdbc:271:669f::/64`) over the LAN using IPv6 Router Advertisements (RAs). The Linux host automatically adds routes for this interface via the physical Ethernet/Wi-Fi adapter (e.g., `enu1c2`) with a low metric (typically `105`).
+- **The Local OTBR** registers a local network interface (`wpan0`) and configures a route for the same prefix, but defaults to a higher metric (typically `120`).
+- **The Failure**: Since a lower metric has higher priority (`105 < 120`), the Linux host routes Thread traffic across the LAN via third-party border routers instead of directly using the local USB coordinator dongle on `wpan0`. If remote border routers restart or drop packets, your local Thread devices instantly go unresponsive.
 
-### Tier 1: Host-Level Route Metric Optimization
-To ensure the local Thread interface (`wpan0`) is always preferred, we deploy a NetworkManager dispatcher script. This script dynamically replaces the Thread route with a preferred metric (`99`) whenever interfaces change state.
+#### The Solution
+We use a **NetworkManager dispatcher script** that runs automatically on network interface changes to dynamically replace the Thread route with a preferred metric (`99`), forcing the local Thread radio interface to take priority.
 
-**File**: `/etc/NetworkManager/dispatcher.d/99-thread-route.sh`
+---
+
+### B. Hardware Offloading & Multicast Snooping
+#### The Background
+- **Hardware Offloading**: Linux hosts often use TCP Segmentation Offload (TSO), Generic Segmentation Offload (GSO), and Generic Receive Offload (GRO) to coalesce small packets to save CPU. However, these features can corrupt or drop small IPv6 multicast packets essential for Thread discovery (mDNS and MLE).
+- **Multicast Snooping**: Docker bridge networks (`br-*` interfaces) enable IGMP/MLD multicast snooping by default. Without an active IGMP/MLD query agent on the virtual bridge, the bridge's multicast forwarding table times out, causing containers to stop receiving critical mDNS packets.
+
+#### The Solution
+We disable network offloads on the physical link and disable multicast snooping on all Docker bridge interfaces. 
+
+---
+
+### The Combined Network Fix: NetworkManager Dispatcher Script
+
+Create the following script on your host. It handles routing priority, offloading, and multicast snooping in one event-driven hook.
+
+**File Location**: `/etc/NetworkManager/dispatcher.d/99-thread-route.sh`
 ```bash
 #!/bin/bash
 INTERFACE=$1
 ACTION=$2
 
-if [ "$INTERFACE" = "wpan0" ] || [ "$INTERFACE" = "enu1c2" ]; then
+# Replace 'enu1c2' with your physical ethernet interface name
+PHYS_IF="enu1c2"
+THREAD_PREFIX="fdbc:271:669f::/64"
+
+if [ "$INTERFACE" = "wpan0" ] || [ "$INTERFACE" = "$PHYS_IF" ]; then
     if [ "$ACTION" = "up" ] || [ "$ACTION" = "route-change" ]; then
-        # Ensure local wpan0 Thread prefix route is preferred (metric 99 < RA metric 105)
-        ip -6 route replace fdbc:271:669f::/64 dev wpan0 metric 99 2>/dev/null
+        # Force local wpan0 interface to take priority for Thread traffic
+        ip -6 route replace $THREAD_PREFIX dev wpan0 metric 99 2>/dev/null
     fi
-    if [ "$INTERFACE" = "enu1c2" ] && [ "$ACTION" = "up" ]; then
-        # Disable hardware offloads to protect multicast frames
-        ethtool -K enu1c2 tso off gso off gro off 2>/dev/null
-        # Disable multicast snooping on docker bridges to prevent timeout drops
+    
+    if [ "$INTERFACE" = "$PHYS_IF" ] && [ "$ACTION" = "up" ]; then
+        # Disable hardware offloads to prevent multicast packet drop/corruption
+        ethtool -K $PHYS_IF tso off gso off gro off 2>/dev/null
+        
+        # Disable multicast snooping on all Docker bridges to allow clean mDNS flow
         for bridge in /sys/class/net/br-*/bridge/multicast_snooping; do
             [ -f "$bridge" ] && echo 0 > "$bridge" 2>/dev/null
         done
@@ -46,23 +60,29 @@ if [ "$INTERFACE" = "wpan0" ] || [ "$INTERFACE" = "enu1c2" ]; then
 fi
 ```
 
-Make it executable:
+Make the script executable:
 ```bash
 sudo chmod +x /etc/NetworkManager/dispatcher.d/99-thread-route.sh
 ```
 
 ---
 
-### Tier 2: Home Assistant Self-Healing Watchdog
-We configured a Home Assistant watchdog automation to detect offline Matter devices, re-apply route optimizations, and reload the integration configuration entry automatically.
+## 2. Application-Level Watchdog (Home Assistant)
 
-**`configuration.yaml`**: Register route optimization command (no SSH required if Home Assistant runs in `privileged` mode with `network_mode: host`):
+### The Background
+Even with optimized routes, Home Assistant's Matter integration can occasionally lose connection to the WebSocket server or get into a stalled state where devices appear offline in the UI. Reloading the integration config entry clears the cache and establishes a clean connection.
+
+### The Solution
+We create a Home Assistant shell command and a watchdog automation.
+
+1. **Register the Shell Command** in your `configuration.yaml` to ensure the route is corrected on demand:
 ```yaml
 shell_command:
   optimize_thread_routes: "ip -6 route replace fdbc:271:669f::/64 dev wpan0 metric 99"
 ```
+*(Note: If Home Assistant is running in docker with `privileged: true` and `network_mode: host`, it has direct privileges to modify the host routing table. No SSH credentials are required).*
 
-**`automations.yaml`**: Watchdog Automation:
+2. **Add the Watchdog Automation** to `automations.yaml`:
 ```yaml
 - id: system_matter_thread_watchdog
   alias: System - Matter & Thread Watchdog (Self-Healing)
@@ -85,41 +105,150 @@ shell_command:
 
 ---
 
-### Tier 3: Matter Server Health Watchdog (Docker Autoheal)
-We improved the `healthcheck.py` script utilized by the `python-matter-server` container (working in tandem with `autoheal`) to reboot the server container if a global Thread partition or major device drop is detected.
+## 3. Container-Level Recovery (`python-matter-server` + `autoheal`)
 
-**Health check rules**:
-- Fail if **5 or more** nodes are stuck (pingable but unavailable).
-- Fail if **8 or more** nodes are completely offline.
-- Fail if **50% or more** of all configured nodes go offline (when total nodes >= 5).
+### The Background
+Sometimes the `python-matter-server` daemon itself stops communicating with the Thread mesh or enters a state where it reports nodes as available to clients but cannot communicate with them. 
 
-**`healthcheck.py` snippet**:
+By combining a **custom container healthcheck** with the **autoheal** utility (a container that monitors Docker events and restarts unhealthy containers), we can automatically restart `python-matter-server` if the Thread network fails.
+
+### The Solution
+
+1. Put the following `healthcheck.py` script inside the data directory mapped to your `python-matter-server` container (e.g. `/data/healthcheck.py`).
+
+**`healthcheck.py`**:
 ```python
-# Extract nodes availability
-unavailable_nodes = [node for node in nodes if not node.available]
-total_count = len(nodes)
+import asyncio
+import sys
+import socket
+import subprocess
+import os
+import time
+from aiohttp import ClientSession
+from matter_server.client import MatterClient
 
-is_unhealthy = False
-reason = ""
+async def ping_ip(ip):
+    cmd = ['ping', '-6', '-c', '1', '-W', '1', ip] if ':' in ip else ['ping', '-c', '1', '-W', '1', ip]
+    def run_ping():
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return res.returncode == 0
+        except Exception:
+            return False
+    return await asyncio.to_thread(run_ping)
 
-if len(stuck_nodes) >= 5:
-    is_unhealthy = True
-    reason = f"{len(stuck_nodes)} nodes are stuck"
-elif len(unavailable_nodes) >= 8:
-    is_unhealthy = True
-    reason = f"{len(unavailable_nodes)} nodes are completely offline"
-elif total_count >= 5 and (len(unavailable_nodes) / total_count) >= 0.5:
-    is_unhealthy = True
-    reason = f"{len(unavailable_nodes)} out of {total_count} nodes are offline (>= 50%)"
+async def check():
+    # 1. Quick socket check (runs immediately even during startup)
+    try:
+        with socket.create_connection(('localhost', 5580), timeout=2):
+            pass
+    except Exception:
+        print('Port 5580 is closed')
+        sys.exit(1)
 
-if is_unhealthy:
-    sys.exit(1)
+    # 2. Get container uptime to bypass checks during container warmup
+    try:
+        uptime = time.time() - os.path.getmtime('/proc/1')
+    except Exception:
+        uptime = 999999
+
+    if uptime < 900: # 15 minutes warmup threshold
+        print(f'Healthy (Warmup - uptime: {int(uptime)}s)')
+        sys.exit(0)
+
+    # 3. Check Matter nodes via WebSocket
+    try:
+        async with ClientSession() as session:
+            async with MatterClient('ws://localhost:5580/ws', session) as client:
+                await client.connect()
+                listen_task = asyncio.create_task(client.start_listening())
+                await asyncio.sleep(2)
+                
+                nodes = client.get_nodes()
+                
+                async def check_node(node):
+                    if node.available:
+                        return None
+                    try:
+                        ips = await client.get_node_ip_addresses(node.node_id)
+                        for ip in ips:
+                            if await ping_ip(ip):
+                                return (node.node_id, ip)
+                    except Exception:
+                        pass
+                    return None
+
+                tasks = [check_node(node) for node in nodes]
+                results = await asyncio.gather(*tasks)
+                stuck_nodes = [r for r in results if r is not None]
+                unavailable_nodes = [node for node in nodes if not node.available]
+                total_count = len(nodes)
+                
+                listen_task.cancel()
+                try:
+                    await listen_task
+                except asyncio.CancelledError:
+                    pass
+                
+                # Unhealthiness conditions:
+                # 1. 5 or more nodes are stuck (pingable but unavailable)
+                # 2. 8 or more nodes are completely offline
+                # 3. 50%+ of all configured nodes are offline (when total nodes >= 5)
+                is_unhealthy = False
+                reason = ""
+                
+                if len(stuck_nodes) >= 5:
+                    is_unhealthy = True
+                    reason = f"{len(stuck_nodes)} nodes are stuck (pingable but unavailable)"
+                elif len(unavailable_nodes) >= 8:
+                    is_unhealthy = True
+                    reason = f"{len(unavailable_nodes)} nodes are completely offline"
+                elif total_count >= 5 and (len(unavailable_nodes) / total_count) >= 0.5:
+                    is_unhealthy = True
+                    reason = f"{len(unavailable_nodes)} out of {total_count} nodes are offline (>= 50%)"
+                
+                if is_unhealthy:
+                    print(f'Unhealthy: {reason}')
+                    sys.exit(1)
+                
+                print(f'Healthy (Total: {total_count}, Offline: {len(unavailable_nodes)}, Stuck: {len(stuck_nodes)})')
+                sys.exit(0)
+    except Exception as e:
+        print(f'Error checking Matter client: {e}')
+        sys.exit(1)
+
+if __name__ == '__main__':
+    asyncio.run(check())
 ```
 
----
+2. **Configure Docker Compose**: Enable the healthcheck and run the autoheal container.
 
-## 3. Results
-With this configuration:
-1. Routing conflicts are permanently avoided.
-2. Minor transient drops trigger automatic integration reloads within 5 minutes.
-3. Major network partitions trigger a safe, automated container reboot.
+**`docker-compose.yml`**:
+```yaml
+services:
+  matter-server:
+    image: ghcr.io/home-assistant-libs/python-matter-server:stable
+    container_name: matter-server
+    network_mode: host
+    restart: unless-stopped
+    labels:
+      autoheal: "true"
+    volumes:
+      - /path/to/matter-server/data:/data
+      - /run/dbus:/run/dbus:ro
+    healthcheck:
+      test: ["CMD", "python3", "/data/healthcheck.py"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+```
