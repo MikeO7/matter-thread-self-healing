@@ -97,11 +97,27 @@ shell_command:
   action:
     # Re-apply correct local Thread route metrics on the host
     - service: shell_command.optimize_thread_routes
+      continue_on_error: true
     
     # Reload the Matter integration config entry (replace with your config entry ID)
     - service: homeassistant.reload_config_entry
       data:
         entry_id: YOUR_MATTER_CONFIG_ENTRY_ID
+      continue_on_error: true
+
+    # Wait 45 seconds to let the integration re-establish connections
+    - delay: '00:00:45'
+    
+    # Retry reload once if devices are still unavailable (resiliency check)
+    - if:
+        - condition: template
+          value_template: >-
+            {{ integration_entities('matter') | select('is_state', 'unavailable') | list | length > 0 }}
+      then:
+        - service: homeassistant.reload_config_entry
+          data:
+            entry_id: YOUR_MATTER_CONFIG_ENTRY_ID
+          continue_on_error: true
 
 # 2. Nightly Healing: Proactively optimizes routes and flushes integration caches at 3:30 AM
 - id: nightly_matter_thread_network_healing
