@@ -82,8 +82,9 @@ shell_command:
 ```
 *(Note: If Home Assistant is running in docker with `privileged: true` and `network_mode: host`, it has direct privileges to modify the host routing table. No SSH credentials are required).*
 
-2. **Add the Watchdog Automation** to `automations.yaml`:
+2. **Add the Watchdog & Nightly Healing Automations** to `automations.yaml`:
 ```yaml
+# 1. Watchdog: Reactively heals the network if any devices go offline for 5 minutes
 - id: system_matter_thread_watchdog
   alias: System - Matter & Thread Watchdog (Self-Healing)
   description: Detects when Matter devices go offline, optimizes routing, and reloads the integration.
@@ -94,10 +95,26 @@ shell_command:
       for:
         minutes: 5
   action:
-    # 1. Re-apply correct local Thread route metrics on the host
+    # Re-apply correct local Thread route metrics on the host
     - service: shell_command.optimize_thread_routes
     
-    # 2. Reload the Matter integration config entry (replace with your config entry ID)
+    # Reload the Matter integration config entry (replace with your config entry ID)
+    - service: homeassistant.reload_config_entry
+      data:
+        entry_id: YOUR_MATTER_CONFIG_ENTRY_ID
+
+# 2. Nightly Healing: Proactively optimizes routes and flushes integration caches at 3:30 AM
+- id: nightly_matter_thread_network_healing
+  alias: System - Nightly Matter & Thread Network Healing
+  description: Performs a proactive optimization, verifies host routes, and refreshes device links nightly.
+  trigger:
+    - platform: time
+      at: '03:30:00'
+  action:
+    # Ensure the host IPv6 routes are correct
+    - service: shell_command.optimize_thread_routes
+    
+    # Reload the Matter integration to clear caches and stale states
     - service: homeassistant.reload_config_entry
       data:
         entry_id: YOUR_MATTER_CONFIG_ENTRY_ID
