@@ -251,4 +251,41 @@ services:
       AUTOHEAL_CONTAINER_LABEL: autoheal
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+
+---
+
+## 4. Radio-Level Optimizations (Transmit Power)
+
+### The Background
+By default, some Thread Border Router coordinators initialize with a low transmit power (e.g., `5 dBm` or ~3mW). This severely limits the range of the coordinator mesh, causing packet dropouts and poor link quality (LQ 1) for distant routers. Setting the transmit power to the hardware limit (typically `20 dBm` or 100mW) dramatically improves range and stability.
+
+Because `ot-ctl` settings do not survive container restarts or reboots, we can persist this setting in the Docker Compose environment by adding the configuration directly to the OTBR container's health check loop.
+
+### The Solution
+
+Update your `docker-compose.yml` to set the transmit power inside the health check script:
+
+```yaml
+  otbr:
+    image: ghcr.io/ownbee/hass-otbr-docker:latest
+    container_name: otbr
+    privileged: true
+    network_mode: host
+    restart: unless-stopped
+    devices:
+      - /dev/serial/by-id/usb-YOUR_DONGLE_ID:/dev/ttyUSB0
+    environment:
+      DEVICE: /dev/ttyUSB0
+      BAUDRATE: "460800"
+      BACKBONE_IF: eth0
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - ot-ctl txpower 20 >/dev/null && ot-ctl state | grep -iE "router|leader|child"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
 ```
+
+*Every 30 seconds, the container automatically re-applies the `20 dBm` transmit power setting, ensuring it persists permanently across reboots.*
