@@ -75,10 +75,11 @@ Even with optimized routes, Home Assistant's Matter integration can occasionally
 ### The Solution
 We create a Home Assistant shell command and a watchdog automation.
 
-1. **Register the Shell Command** in your `configuration.yaml` to ensure the route is corrected on demand:
+1. **Register the Shell Commands** in your `configuration.yaml` to ensure the route is corrected on demand and offline devices are logged:
 ```yaml
 shell_command:
   optimize_thread_routes: "ip -6 route replace fdbc:271:669f::/64 dev wpan0 metric 99"
+  log_offline_devices: "echo \"$(date): {{ devices }}\" >> /config/offline_devices.log"
 ```
 *(Note: If Home Assistant is running in docker with `privileged: true` and `network_mode: host`, it has direct privileges to modify the host routing table. No SSH credentials are required).*
 
@@ -95,6 +96,13 @@ shell_command:
       for:
         minutes: 5
   action:
+    # Log the exact offline devices before healing
+    - service: shell_command.log_offline_devices
+      data:
+        devices: >-
+          {{ integration_entities('matter') | select('is_state', 'unavailable') | map(attribute='entity_id') | list | join(', ') }}
+      continue_on_error: true
+
     # Re-apply correct local Thread route metrics on the host
     - service: shell_command.optimize_thread_routes
       continue_on_error: true
