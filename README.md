@@ -35,6 +35,14 @@ if [ "$INTERFACE" = "wpan0" ] || [ "$INTERFACE" = "enu1c2" ]; then
         # Ensure local wpan0 Thread prefix route is preferred (metric 99 < RA metric 105)
         ip -6 route replace fdbc:271:669f::/64 dev wpan0 metric 99 2>/dev/null
     fi
+    if [ "$INTERFACE" = "enu1c2" ] && [ "$ACTION" = "up" ]; then
+        # Disable hardware offloads to protect multicast frames
+        ethtool -K enu1c2 tso off gso off gro off 2>/dev/null
+        # Disable multicast snooping on docker bridges to prevent timeout drops
+        for bridge in /sys/class/net/br-*/bridge/multicast_snooping; do
+            [ -f "$bridge" ] && echo 0 > "$bridge" 2>/dev/null
+        done
+    fi
 fi
 ```
 
