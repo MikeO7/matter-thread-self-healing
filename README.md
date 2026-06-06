@@ -289,3 +289,62 @@ Update your `docker-compose.yml` to set the transmit power inside the health che
 ```
 
 *Every 30 seconds, the container automatically re-applies the `20 dBm` transmit power setting, ensuring it persists permanently across reboots.*
+
+---
+
+## 5. Benchmarking & Optimal Transmit Power Tuning
+
+### Why Balance Matters
+Simply cranking the coordinator's transmit power to the maximum (`20 dBm` / 100mW) is not always ideal:
+1. **Receiver Saturation**: Devices located very close to the coordinator can have their radios overloaded, causing packet drops.
+2. **Wi-Fi/Bluetooth Interference**: Thread sharing the 2.4GHz spectrum can interfere with nearby Wi-Fi routers or Zigbee coordinators if transmitting at high power.
+3. **Power & Thermal Load**: Higher power increases thermal output on small USB dongles.
+
+The goal is to find the **lowest possible transmit power** where all devices maintain a solid, stable link (typically an average RSSI >= `-85 dBm`).
+
+### The Benchmarking Script (`benchmark.py`)
+We created a Python script that automatically cycles through power levels (`5, 8, 11, 14, 17, and 20 dBm`), logs the signal strengths of all connected Thread neighbors, and provides a clear recommendation.
+
+> [!NOTE]
+> OpenThread uses exponentially smoothed sliding averages for the `Avg RSSI` metric. This means changing power levels takes time to reflect in the neighbor table. The script defaults to a **5-minute (300s) settle time** at each step to allow averages to converge. For a quick test, you can edit `SETTLE_TIME_SECONDS` in the script to `15` seconds.
+
+#### How to Run the Benchmark
+1. Ensure the script is executable on your host:
+   ```bash
+   chmod +x benchmark.py
+   ```
+2. Run the script:
+   ```bash
+   python3 benchmark.py
+   ```
+
+#### Sample Output
+Below is an example output showing how the signal strength scales across different power levels:
+
+```text
+================================================================
+ Thread Transmit Power Benchmark Tool
+================================================================
+Starting benchmark. We will test power levels: [5, 8, 11, 14, 17, 20]
+Waiting 15 seconds at each step for link metrics to settle...
+Do not modify network settings during the test.
+
+--> Setting Tx Power to 5 dBm...
+    Reading neighbor table...
+...
+================================================================
+ Benchmark Results (Average RSSI per power level)
+================================================================
+Neighbor (Extended MAC) | RLOC16   |   5dBm |   8dBm |  11dBm |  14dBm |  17dBm |  20dBm
+----------------------------------------------------------------------------------------
+1211546fef5f3b73        | 0x3400   |   -78  |   -78  |   -78  |   -78  |   -78  |   -78
+1e7dcb48c41b8ed8        | 0x5400   |   -74  |   -74  |   -74  |   -74  |   -74  |   -74
+96d2a73831e3e919        | 0xe800   |   -89  |   -89  |   -89  |   -90  |   -90  |   -90
+aa52d4a00dba4622        | 0x8000   |   -57  |   -57  |   -57  |   -56  |   -56  |   -56
+...
+
+Recommendations:
+⚠ No single power level satisfied all conditions (due to distant node 96d2a73831e3e919 at -90 dBm).
+  We recommend staying at 20 dBm to maximize range for weaker/distant nodes.
+```
+
